@@ -6,11 +6,9 @@ Useful trace links:
 - Traces (access requires an LDAP ID): https://drive.google.com/drive/folders/1zYchkn-M1auZp_l5wRkIzAcDYPkNtW3H?usp=sharing
 - ChampSim wiki: https://champsim.github.io/ChampSim/master/index.html
 
-## Clone the repository
+## Project Overview
 
-```bash
-git clone https://github.com/Shivraj1906/PA2-CS683-2026.git
-```
+This project was developed at **IIT Bombay** as part of **CS683 – Advanced Computer Architecture**. It explores microarchitecture performance optimization using ChampSim by implementing and evaluating IP-stride and Signature Path Prefetching (SPP), along with RRIP-based and instruction-aware cache replacement policies. The implementations are evaluated using simulation metrics such as IPC, prefetch accuracy, and cache performance.
 
 ## Compile
 
