@@ -1,246 +1,38 @@
 #include "cache.h"
 
-#define IP_TRACKER_COUNT 24
-#define MASK_IP 0xFF
+#define IPT_SIZE 64
+#define PT_SIZE 4096
+#define SIG_MASK 0xFFF
+#define SIG_SHIFT 3
+#define MAX_CONF 3
+#define PAGE_LINES 64
+#define PT_THRESH 1
+#define WINDOW 256
 
-#define PATTERN_UNIFORM 0
-#define PATTERN_NON_UNIFORM 1
-
-// For unifrom strides define threshold to start prefetching
-#define STATE_THRESHOLD 3
-
-// Signature = last SIGNATURE_LENGTH strides, SIGNATURE_BITS each 
-#define SIGNATURE_LENGTH 3
-#define SIGNATURE_BITS 7
-
-// mask used in signature to keep only SIGNATURE_LENGTH stirdes valid and clear out rest of the above bits
-#define SIGNATURE_MASK ((1ULL << (SIGNATURE_LENGTH * SIGNATURE_BITS)) - 1)
-
-// Signature table is direct mapped (index = hash of ip + signature)
-#define SIGNATURE_TABLE_BITS 8
-#define SIGNATURE_TABLE_SIZE (1 << SIGNATURE_TABLE_BITS)
-#define MAX_SIGNATURE_CONFIDENCE 3
-#define SIGNATURE_CONFIDENCE_THRESHOLD 2
-
-// Throttler (tracker must be larger than what can be in flight in one window)
-#define PREFETCH_TRACKER_SIZE 256
-#define ACCURACY_WINDOW 128
-#define PREFETCH_DEGREE 3
-#define MIN_PREFETCH_DEGREE 1
-#define MAX_PREFETCH_DEGREE 6
-#define HIGH_ACCURACY 75
-#define LOW_ACCURACY 40
-
-
-class IP_TRACKER{
-
-    public:
-        // the ip we are tracking
-        uint64_t ip;
-
-        // last address accessed by this IP
-        uint64_t last_cl_addr;
-
-        // the last observed stride
-        int64_t last_stride;
-
-        // used to classify the type of pattern we are observing
-        uint8_t pattern_type;
-
-        // Number of consecutive times the same stride was seen 
-        int32_t state;
-
-        // The last SIGNATURE_LENGTH strides packed from LSB
-        uint64_t signature;
-
-        // Number of strides shifted into the signature so far (if less than SIGNATURE_LENGTH valid signature not found yet)
-        int32_t signature_count;
-
-        // lru used for replacement
-        uint32_t lru;
-
-
-        IP_TRACKER(){
-            ip = 0;
-            last_cl_addr = 0;
-            last_stride = 0;
-            pattern_type = PATTERN_UNIFORM;
-            state = 0;
-            signature = 0;
-            signature_count = 0;
-            lru = 0;
-        }
+struct IPT_Entry{
+    uint16_t valid;
+    uint16_t tag;
+    uint16_t last_page;
+    uint16_t last_offset;
+    int last_stride;
+    uint16_t stride_conf;
+    uint16_t sig;
 };
 
-// Used for mapping of signature to stride
-class SIGNATURE_ENTRY{
-    public:
-        // (ip, signature) pair, used as for tracking
-        uint64_t key;
-
-        // stride observed after this signature (can be negative)
-        int32_t next_stride;
-
-        // repr. how confident this signature is
-        int32_t confidence;
-
-        // whether this entry currently contains a valid info
-        bool valid;
-
-        SIGNATURE_ENTRY(){
-            key = 0;
-            next_stride = 0;
-            confidence = 0;
-            valid = false;
-        }
+struct PT_Entry{
+    int next_stride;
+    int conf; 
 };
 
-// Used for throttler
-class PREFETCH_ENTRY{
-    public:
-        // Cache-line address that was prefetched
-        uint64_t cl_addr;
+int spp_degree = 4;
+uint64_t last_useful = 0;
+uint64_t last_issued = 0;
+IPT_Entry ipt[IPT_SIZE];
+PT_Entry pt[PT_SIZE];
 
-        // Whether this entry is valid
-        bool valid;
-
-        // Whether this prefetch was later used by a demand access
-        bool used;
-
-        PREFETCH_ENTRY(){
-            cl_addr = 0;
-            valid = false;
-            used = false;
-        }
-};
-
-// track ips
-IP_TRACKER trackers[IP_TRACKER_COUNT];
-
-// track observed signature -> next stride mappings
-SIGNATURE_ENTRY signatures[SIGNATURE_TABLE_SIZE];
-
-// Track recently issued prefetches for accuracy calculation
-PREFETCH_ENTRY prefetch_tracker[PREFETCH_TRACKER_SIZE];
-
-// Current dynamic prefetch degree
-int32_t current_degree;
-
-// Overall statistics
-uint64_t total_prefetches;
-uint64_t useful_prefetches;
-
-// Statistics for the current accuracy epoch
-uint64_t epoch_prefetches;
-uint64_t epoch_useful_prefetches;
-
-
-
-// SIGNATURE HELPER FUNCTIONS STARTS FROM HERE -----------
-
-// Shift a new stride into a signature
-uint64_t update_signature(uint64_t signature, int64_t stride){
-    uint64_t encoded = (uint64_t)stride & ((1 << SIGNATURE_BITS) - 1);
-    return ((signature << SIGNATURE_BITS) ^ encoded) & SIGNATURE_MASK;
+uint16_t update_sig(uint16_t sig, int stride){
+    return ((sig<<SIG_SHIFT) ^ (stride & 0x7F)) & SIG_MASK;
 }
-
-// Find the table slot for (ip, signature), the key is returned for checking 
-SIGNATURE_ENTRY& get_signature_entry(uint64_t ip, uint64_t signature, uint64_t &key){
-    key = (ip << (SIGNATURE_LENGTH * SIGNATURE_BITS)) | signature;
-    uint64_t folded = key ^ (key >> 8) ^ (key >> 16) ^ (key >> 24);   // every part of key (ip + all strides) affects the slot, basically used for more uniformity and less hash collision
-    return signatures[folded % SIGNATURE_TABLE_SIZE];
-}
-
-// Learn that signature was followed by which stride
-void train_signature(uint64_t ip, uint64_t signature, int64_t stride){
-    uint64_t key;
-    SIGNATURE_ENTRY &entry = get_signature_entry(ip, signature, key);
-
-    // Empty slot or a different (ip, signature) -> take it over
-    if(!entry.valid || entry.key != key){
-        entry.valid = true;
-        entry.key = key;
-        entry.next_stride = stride;
-        entry.confidence = 1;
-        return;
-    }
-
-    if(entry.next_stride == stride){
-        if(entry.confidence < MAX_SIGNATURE_CONFIDENCE)
-            entry.confidence++;
-    }else{
-        entry.confidence--;
-
-        // Old prediction lost confidence, switch to the new stride
-        if(entry.confidence <= 0){
-            entry.next_stride = stride;
-            entry.confidence = 1;
-        }
-    }
-}
-
-
-// Returns a confident prediction, or NULL if there is none
-SIGNATURE_ENTRY* lookup_signature(uint64_t ip, uint64_t signature){
-    uint64_t key;
-    SIGNATURE_ENTRY &entry = get_signature_entry(ip, signature, key);
-
-    if(entry.valid && entry.key == key && entry.confidence >= SIGNATURE_CONFIDENCE_THRESHOLD)
-        return &entry;
-
-    return NULL;
-}
-
-// Signature helper functions ends here ----------
-
-
-// Helper functions for throttler begins here ---------
-
-// Remember a prefetch that was issued
-void record_prefetch(uint64_t cl_addr){
-    PREFETCH_ENTRY &entry = prefetch_tracker[cl_addr % PREFETCH_TRACKER_SIZE];
-
-    // same line already requested and not used yet
-    if(entry.valid && !entry.used && entry.cl_addr == cl_addr)
-        return;
-
-    entry.cl_addr = cl_addr;
-    entry.valid = true;
-    entry.used = false;
-
-    total_prefetches++;
-    epoch_prefetches++;
-}
-
-// Check whether a demand access used a prefetched line.
-void check_useful_prefetch(uint64_t cl_addr){
-    PREFETCH_ENTRY &entry = prefetch_tracker[cl_addr % PREFETCH_TRACKER_SIZE];
-
-    if(entry.valid && !entry.used && entry.cl_addr == cl_addr){
-        entry.used = true;
-        useful_prefetches++;
-        epoch_useful_prefetches++;
-    }
-}
-
-// Once per window, raise or lower the degree based on accuracy
-void update_throttler(){
-    if(epoch_prefetches < ACCURACY_WINDOW)
-        return;
-
-    int accuracy = (int)((epoch_useful_prefetches * 100) / epoch_prefetches);
-
-    if(accuracy >= HIGH_ACCURACY && current_degree < MAX_PREFETCH_DEGREE)
-        current_degree++;
-    else if(accuracy < LOW_ACCURACY && current_degree > MIN_PREFETCH_DEGREE)
-        current_degree--;
-
-    epoch_prefetches = 0;
-    epoch_useful_prefetches = 0;
-}
-
-// Helper functions for throttler ends here ----
-
 
 void CACHE::l1d_prefetcher_initialize() 
 {
@@ -248,182 +40,116 @@ void CACHE::l1d_prefetcher_initialize()
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 
-    // Initialize IP tracker LRU
-    for(int i = 0; i < IP_TRACKER_COUNT; i++){
-        trackers[i].lru = i;
+    for(int i=0; i<IPT_SIZE; i++){
+        ipt[i]=IPT_Entry{};
     }
-
-    // Initialize signature table
-    for(int i = 0; i < SIGNATURE_TABLE_SIZE; i++){
-        signatures[i].valid = false;
+    for(int i=0; i<PT_SIZE; i++){
+        pt[i]=PT_Entry{};
     }
-
-    // Initialize prefetch tracking table
-    for(int i = 0; i < PREFETCH_TRACKER_SIZE; i++){
-        prefetch_tracker[i].valid = false;
-        prefetch_tracker[i].used = false;
-    }
-
-    // Initialize throttling state
-    current_degree = PREFETCH_DEGREE;
-
-    total_prefetches = 0;
-    useful_prefetches = 0;
-
-    epoch_prefetches = 0;
-    epoch_useful_prefetches = 0;
 }
 
-void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
-{
-    // Get the block address 
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag){
+    if(type==PREFETCH)
+        return;
+
+    if(pf_lower_level < last_issued){
+        last_useful = pf_useful;
+        last_issued = pf_lower_level;
+    }
+    uint64_t issued_now = pf_lower_level - last_issued;
+    if(issued_now >= WINDOW){
+        double acc = (pf_useful - last_useful)/(double) issued_now;
+
+        if(acc >= 0.75) spp_degree = 6;
+        else if(acc >= 0.5) spp_degree = 4;
+        else if(acc >= 0.25) spp_degree = 2;
+        else spp_degree = 1;
+        
+        last_useful = pf_useful;
+        last_issued = pf_lower_level;
+    }
+    
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint64_t page = addr >> LOG2_PAGE_SIZE;
+    int offset = cl_addr & (PAGE_LINES-1);
 
-    // Check if this demand access used an earlier prefetch
-    check_useful_prefetch(cl_addr);
+    int idx = ip % IPT_SIZE;
+    uint16_t tag = (ip >> 6) & 0xFF;
+    IPT_Entry &e = ipt[idx];
 
-    // Get masked IP
-    ip = ip & MASK_IP;
-
-    int index = -1;
-    for (index=0; index<IP_TRACKER_COUNT; index++) {
-        if (trackers[index].ip == ip)
-            break;
+    if(!e.valid || e.tag != tag){
+        e.valid = 1;
+        e.tag = tag;
+        e.last_page = page & 0xFF;
+        e.last_offset = offset;
+        e.last_stride = 0;
+        e.stride_conf=0;
+        e.sig = 0;
+        return;
     }
 
-    // This is a new IP
-    if(index == IP_TRACKER_COUNT){
-        for (index=0; index<IP_TRACKER_COUNT; index++) {
-            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
-                break;
-        }
-
-        trackers[index].ip = ip;
-        trackers[index].last_cl_addr = cl_addr;
-        trackers[index].last_stride = 0;
-        trackers[index].state = 0;
-        trackers[index].signature = 0;
-        trackers[index].signature_count = 0;
-        trackers[index].pattern_type = PATTERN_UNIFORM;
-
-        // increment lru of other index makes sure we always have a evict ip ready
-	    for (int i=0; i<IP_TRACKER_COUNT; i++) {
-            if (trackers[i].lru < trackers[index].lru)
-                trackers[i].lru++;
-        }
-        trackers[index].lru = 0;
-
-        return;     
+    if((page & 0xFF) != e.last_page){
+        e.last_page = page & 0xFF;
+        e.last_offset = offset;
+        e.sig = 0;
+        return;
     }
 
-    // performing sanity check
-    if(index == -1){
-        assert(0);
-    }
+    int stride = offset - e.last_offset;
 
-    int64_t stride = 0;
-    // Safely getting stride
-    if (cl_addr > trackers[index].last_cl_addr)
-        stride = cl_addr - trackers[index].last_cl_addr;
-    else {
-        stride = trackers[index].last_cl_addr - cl_addr;
-        stride *= -1;
-    }
-
-    // if same address seen in a row, ignore
     if(stride == 0){
         return;
     }
 
-    // Train using the signature from BEFORE this stride was added,
-    // it is the one that predicts this stride
-    if(trackers[index].signature_count >= SIGNATURE_LENGTH){
-        train_signature(ip, trackers[index].signature, stride);
-    }
-
-    // Count consecutive equal strides, if any change we reset it.
-    // This is also what lets an IP go back to uniform later.
-    if(stride == trackers[index].last_stride){
-        if(trackers[index].state < 7)
-            trackers[index].state++;
+    if(stride == e.last_stride){
+        if(e.stride_conf<MAX_CONF)
+            e.stride_conf++;
     }else{
-        trackers[index].state = 0;
+        if(e.stride_conf>0)
+            e.stride_conf--;
     }
 
-    // Shift the new stride into the signature
-    trackers[index].signature = update_signature(trackers[index].signature, stride);
-
-    if(trackers[index].signature_count < SIGNATURE_LENGTH){
-        trackers[index].signature_count++;
+    PT_Entry &p = pt[e.sig];
+    if(p.next_stride == stride){
+        if(p.conf < MAX_CONF)
+            p.conf++;
+    }else if(p.conf > 0){
+        p.conf--;
+    }else{
+        p.next_stride=stride;
     }
 
-    trackers[index].last_cl_addr = cl_addr;
-    trackers[index].last_stride = stride;
-
-    // Uniform has priority, otherwise will fall back to non-uniform
-    if(trackers[index].state >= STATE_THRESHOLD)
-        trackers[index].pattern_type = PATTERN_UNIFORM;
-    else
-        trackers[index].pattern_type = PATTERN_NON_UNIFORM;
-
-    // Issue one prefetch, returns false when we should stop
-    auto issue_prefetch = [&](int64_t pf_cl_addr) -> bool {
-        if(pf_cl_addr < 0)
-            return false;
-
-        uint64_t pf_address = (uint64_t)pf_cl_addr << LOG2_BLOCK_SIZE;
-
-        // only issue a prefetch if the prefetch address is in the same 4 KB page
-        // as the current demand access address
-        if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
-            return false;
-
-        // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
-        int fill_level = (MSHR.occupancy < (MSHR.SIZE>>1)) ? FILL_L1 : FILL_L2;
-
-        if(prefetch_line(ip, addr, pf_address, fill_level, 0))
-            record_prefetch(pf_cl_addr);
-
-        return true;
-    };
-
-    if(trackers[index].pattern_type == PATTERN_UNIFORM){
-        // constant stride
-        for (int i=0; i<current_degree; i++) {
-            if(!issue_prefetch((int64_t)cl_addr + stride*(i+1)))
+    e.sig = update_sig(e.sig, stride);
+    e.last_stride = stride;
+    e.last_offset = offset;
+    int target;
+    if(e.stride_conf >= 2){
+        target  = offset;
+        for(int i=0; i<spp_degree; i++){
+            target += stride;
+            if(target < 0 || target >= PAGE_LINES){
                 break;
+            }
+            uint64_t pf_addr = (page << LOG2_PAGE_SIZE) + (target << LOG2_BLOCK_SIZE);
+            prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
         }
-    }else if(trackers[index].signature_count >= SIGNATURE_LENGTH){
-        // Follow the signature chain: every predicted stride is shifted into
-        // a temporary signature to predict the stride after it
-        uint64_t signature = trackers[index].signature;
-        int64_t next_cl_addr = (int64_t)cl_addr;
-
-        for (int i=0; i<current_degree; i++) {
-            SIGNATURE_ENTRY *entry = lookup_signature(ip, signature);
-
-            // No confident prediction, stop here
-            if(entry == NULL)
-                break;
-
-            next_cl_addr += entry->next_stride;
-
-            if(!issue_prefetch(next_cl_addr))
-                break;
-
-            signature = update_signature(signature, entry->next_stride);
+        return;
+    }
+    uint16_t s = e.sig;
+    target = offset;
+    for(int i=0; i<spp_degree; i++){
+        PT_Entry &q = pt[s];
+        if(q.conf < PT_THRESH){
+            break;
         }
+        target += q.next_stride;
+        if(target < 0 || target >= PAGE_LINES){
+            break;
+        }
+        uint64_t pf_addr = (page << LOG2_PAGE_SIZE) + (target << LOG2_BLOCK_SIZE);
+        prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+        s = update_sig(s, q.next_stride);
     }
-
-    for(int i = 0; i < IP_TRACKER_COUNT; i++){
-        if(trackers[i].lru < trackers[index].lru)
-            trackers[i].lru++;
-    }
-
-    trackers[index].lru = 0;
-
-    // Update throttler
-    update_throttler();
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
@@ -433,23 +159,5 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-    cout<< " -------------------- FINAL STATS for prefectcher------------------" <<endl;
-    cout << "CPU " << cpu << " L1D SPP final stats" << endl;
-    cout << "Final degree: " << current_degree << endl;
-    cout << "Total prefetches: " << total_prefetches << endl;
-    cout << "Useful prefetches: " << useful_prefetches << endl;
-
-    // Show accuracy of prefetcher
-    if(total_prefetches > 0){
-        cout << "Accuracy: " << (100.0 * useful_prefetches / total_prefetches) << "%" << endl;
-    }
-
-
-    // last set of entries shown to check if table is functional
-    //cout<<"---------- Last Signature table entries --------"<<endl;
-    //cout<<endl;
-    //cout<< "key \t\t next_stride \t\t confidence \t\t valid" << endl;
-    //for(int i=0 ; i<SIGNATURE_TABLE_SIZE ; i++){
-    //    cout<< signatures[i].key <<" \t\t " << signatures[i].next_stride<<" \t\t "<< signatures[i].confidence << " \t\t "<<signatures[i].valid<<endl;
-    //}
+    cout << "Degree: " << spp_degree << endl;
 }

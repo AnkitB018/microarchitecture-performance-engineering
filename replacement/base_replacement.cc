@@ -88,4 +88,3 @@ void CACHE::lru_update(uint32_t set, uint32_t way)
     }
     block[set][way].lru = 0; // promote to the MRU position
 }
-
